@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
 from pathlib import Path
+import socket
 import tempfile
 import threading
 import time
@@ -29,7 +30,7 @@ CREATED = (
 )
 COMPLETED = (
     b'event: response.completed\n'
-    b'data: {"type":"response.completed","response":{"id":"resp_test","model":"glm-test","status":"completed"}}\n\n'
+    b'data: {"type":"response.completed","response":{"id":"resp_test","model":"glm-test","status":"completed","usage":{"input_tokens":1234,"output_tokens":56,"total_tokens":1290}}}\n\n'
 )
 
 
@@ -37,6 +38,7 @@ class MockUpstream(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     captures: list[dict[str, Any]] = []
     capture_lock = threading.Lock()
+    scenario_attempts: dict[str, int] = {}
 
     def log_message(self, _format: str, *_args: Any) -> None:
         return
@@ -70,6 +72,24 @@ class MockUpstream(BaseHTTPRequestHandler):
         self._handle(b"")
 
     def do_POST(self) -> None:  # noqa: N802 - http.server 约定名称
+        if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+            body = bytearray()
+            while True:
+                size_line = self.rfile.readline()
+                if not size_line:
+                    raise ConnectionError("chunked 请求体在块长度前提前结束")
+                size = int(size_line.split(b";", 1)[0].strip(), 16)
+                if size == 0:
+                    # 消费最后一个块后的可选 trailer，直到空行。
+                    while self.rfile.readline() not in {b"\r\n", b"\n", b""}:
+                        pass
+                    break
+                body.extend(self.rfile.read(size))
+                ending = self.rfile.read(2)
+                if ending != b"\r\n":
+                    raise ConnectionError("chunked 请求块缺少 CRLF")
+            self._handle(bytes(body))
+            return
         length = int(self.headers.get("Content-Length", "0") or "0")
         self._handle(self.rfile.read(length))
 
@@ -77,6 +97,19 @@ class MockUpstream(BaseHTTPRequestHandler):
         self._capture(body)
         query = parse_qs(urlsplit(self.path).query)
         scenario = query.get("scenario", ["normal"])[0]
+
+        if scenario == "drop_once":
+            with self.capture_lock:
+                attempt = self.scenario_attempts.get(self.path, 0) + 1
+                self.scenario_attempts[self.path] = attempt
+            if attempt == 1:
+                self.close_connection = True
+                try:
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                self.connection.close()
+                return
 
         if scenario.startswith("status"):
             status = int(scenario.removeprefix("status"))
@@ -270,6 +303,14 @@ def run_self_test(keep_logs: bool = False) -> int:
             check(response.status_code == 200, f"{path} 返回 {response.status_code}")
             check(b"response.completed" in response.content, f"{path} 缺少完成事件")
             check(b"response.failed" not in response.content, f"{path} 被误判为断流")
+        check(
+            any(
+                item["event"] == "请求正常结束"
+                and item["fields"].get("input_tokens") == 1234
+                for item in diag.tail(2000)
+            ),
+            "完成日志未记录 input_tokens",
+        )
 
     record("动态路由和正常 completed 流", normal_and_routes)
 
@@ -288,6 +329,52 @@ def run_self_test(keep_logs: bool = False) -> int:
         check(settings.reuse_upstream_client is True, "NVIDIA 模式没有复用共享客户端")
 
     record("上下文正文和请求头透明转发", forwarding)
+
+    def adaptive_chunked_upload() -> None:
+        large_body = json.dumps(
+            {
+                "model": "glm-test",
+                "stream": True,
+                "input": "x" * (settings.chunked_threshold_bytes + 4096),
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        response = httpx.post(
+            base + "/api/v1/responses?scenario=normal&case=chunked",
+            headers=headers,
+            content=large_body,
+            timeout=8.0,
+        )
+        check(response.status_code == 200, f"分块上传返回 {response.status_code}")
+        capture = MockUpstream.captures[-1]
+        check(capture["body"] == large_body, "分块上传改变了请求正文")
+        lower_headers = {k.lower(): v for k, v in capture["headers"].items()}
+        check(
+            lower_headers.get("transfer-encoding", "").lower() == "chunked",
+            "大请求没有使用 chunked framing",
+        )
+        check("content-length" not in lower_headers, "分块上传仍携带 Content-Length")
+        check(
+            any(item["event"] == "大请求启用分块上传" for item in diag.tail(2000)),
+            "没有记录分块上传中文日志",
+        )
+
+    record("大请求透明分块上传", adaptive_chunked_upload)
+
+    def fresh_connection_retry() -> None:
+        before = len(MockUpstream.captures)
+        response = post(
+            f"/api/v1/responses?scenario=drop_once&case={time.monotonic_ns()}"
+        )
+        check(response.status_code == 200, f"全新连接重试返回 {response.status_code}")
+        check(b"response.completed" in response.content, "全新连接重试后未完成")
+        captures = MockUpstream.captures[before:]
+        check(len(captures) == 2, f"预期两次上游尝试，实际 {len(captures)}")
+        recent_events = [item["event"] for item in diag.tail(2000)]
+        check("上游连接失败准备重试" in recent_events, "没有记录重试准备日志")
+        check("全新连接重试成功" in recent_events, "没有记录重试成功日志")
+
+    record("NVIDIA 式预响应头全新连接重试", fresh_connection_retry)
 
     def heartbeat() -> None:
         response = post("/api/v1/responses?scenario=silent")

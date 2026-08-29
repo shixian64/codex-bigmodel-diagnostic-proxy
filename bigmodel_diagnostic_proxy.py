@@ -3,9 +3,10 @@
 
 设计目标：
 1. 不把 Chat Completions 改写为 Responses；上游 SSE 事件内容透明转发。
-2. 默认强制 HTTP/1.1、每次请求使用新上游连接，避开坏连接复用/HTTP2 中间盒问题。
-3. 用中文日志记录 DNS、TLS、响应头、首字节、SSE 进度、静默和断流位置。
-4. Authorization、Cookie 和请求正文默认不落盘。
+2. 默认复刻 NVIDIA/OpenAI SDK 的共享 HTTP/1.1 连接池和预响应头重试行为。
+3. 大请求可用 HTTP/1.1 chunked 透明分块上传，规避企业代理固定长度缓冲边界。
+4. 用中文日志记录 DNS、TLS、响应头、首字节、SSE 进度、静默和断流位置。
+5. Authorization、Cookie 和请求正文默认不落盘。
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ from flask import Flask, Response, jsonify, request, send_file
 from werkzeug.datastructures import Headers
 
 
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.4.0"
 BASE_DIR = Path(__file__).resolve().parent
 
 
@@ -114,6 +115,11 @@ class Settings:
     synthesize_failure_event: bool = True
     queue_chunks: int = 256
     startup_probe: bool = True
+    preheader_retries: int = 2
+    retry_backoff_seconds: float = 0.25
+    request_upload_mode: str = "adaptive"
+    chunked_threshold_bytes: int = 90000
+    upload_chunk_bytes: int = 8192
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -153,6 +159,13 @@ class Settings:
                 "BIGMODEL_TRANSPORT_PROFILE 只能是 nvidia 或 isolated"
             )
         nvidia_profile = transport_profile == "nvidia"
+        request_upload_mode = os.environ.get(
+            "BIGMODEL_REQUEST_UPLOAD_MODE", "adaptive"
+        ).strip().lower()
+        if request_upload_mode not in {"adaptive", "content-length", "chunked"}:
+            raise ValueError(
+                "BIGMODEL_REQUEST_UPLOAD_MODE 只能是 adaptive、content-length 或 chunked"
+            )
         return cls(
             bind_host=bind_host,
             bind_port=_env_int("BIGMODEL_PROXY_PORT", 8765, 1, 65535),
@@ -189,6 +202,19 @@ class Settings:
             synthesize_failure_event=_env_bool("BIGMODEL_SYNTHESIZE_FAILURE_EVENT", True),
             queue_chunks=_env_int("BIGMODEL_QUEUE_CHUNKS", 256, 8, 8192),
             startup_probe=_env_bool("BIGMODEL_STARTUP_PROBE", True),
+            preheader_retries=_env_int(
+                "BIGMODEL_PREHEADER_RETRIES", 2 if nvidia_profile else 0, 0, 8
+            ),
+            retry_backoff_seconds=_env_float(
+                "BIGMODEL_RETRY_BACKOFF", 0.25, 0, 30
+            ),
+            request_upload_mode=request_upload_mode,
+            chunked_threshold_bytes=_env_int(
+                "BIGMODEL_CHUNKED_THRESHOLD_BYTES", 90000, 1024, 100 * 1024 * 1024
+            ),
+            upload_chunk_bytes=_env_int(
+                "BIGMODEL_UPLOAD_CHUNK_BYTES", 8192, 1024, 1024 * 1024
+            ),
         )
 
     def public_dict(self) -> dict[str, Any]:
@@ -201,6 +227,13 @@ class Settings:
 SENSITIVE_NAME_RE = re.compile(
     r"authorization|api[-_]?key|token|secret|password|cookie|credential", re.I
 )
+SAFE_TOKEN_METRIC_NAMES = {
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "cached_input_tokens",
+    "reasoning_tokens",
+}
 CONTENT_NAME_RE = re.compile(r"content|input|instructions|prompt|text", re.I)
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -263,6 +296,8 @@ def _redact_text(text: str) -> str:
 
 def _redact_value(value: Any, key: str = "") -> Any:
     """递归脱敏所有日志字段；调用者忘记脱敏时仍有最后一道保护。"""
+    if key.lower() in SAFE_TOKEN_METRIC_NAMES and isinstance(value, (int, float)):
+        return value
     if SENSITIVE_NAME_RE.search(key):
         return "***REDACTED***"
     if isinstance(value, dict):
@@ -609,7 +644,8 @@ def _transport_details(response: httpx.Response) -> dict[str, Any]:
         ssl_object = stream.get_extra_info("ssl_object")
         if ssl_object is not None:
             cert = ssl_object.getpeercert() or {}
-            cert_der = ssl_object.getpeercert(binary_form=True)
+            # Python 3.14 的 _SSLSocket.getpeercert 不再接受关键字参数。
+            cert_der = ssl_object.getpeercert(True)
             details.update(
                 {
                     "tls_version": ssl_object.version(),
@@ -647,6 +683,9 @@ class SseTracker:
         self.model = model
         self.response_id = ""
         self.buffer = b""
+        self.input_tokens: int | None = None
+        self.output_tokens: int | None = None
+        self.total_tokens: int | None = None
         self.bytes_total = 0
         self.chunk_count = 0
         self.event_count = 0
@@ -753,6 +792,12 @@ class SseTracker:
                     if isinstance(response_obj, dict):
                         self.response_id = str(response_obj.get("id") or self.response_id)
                         self.model = str(response_obj.get("model") or self.model or "")
+                        usage_obj = response_obj.get("usage")
+                        if isinstance(usage_obj, dict):
+                            self._capture_usage_locked(usage_obj)
+                    usage_obj = obj.get("usage")
+                    if isinstance(usage_obj, dict):
+                        self._capture_usage_locked(usage_obj)
                     self.response_id = str(obj.get("id") or self.response_id)
                     self.model = str(obj.get("model") or self.model or "")
             except Exception:
@@ -771,6 +816,7 @@ class SseTracker:
                 elapsed_ms=round((now - self.started_at) * 1000),
                 trailing=trailing,
             )
+
         if event_type in {"response.completed", "response.failed", "error", "[DONE]"}:
             self.terminal = True
             self.diag.emit(
@@ -794,6 +840,16 @@ class SseTracker:
                 self.request_id,
                 event_index=self.event_count,
             )
+
+    def _capture_usage_locked(self, usage: dict[str, Any]) -> None:
+        for field, attribute in (
+            ("input_tokens", "input_tokens"),
+            ("output_tokens", "output_tokens"),
+            ("total_tokens", "total_tokens"),
+        ):
+            value = usage.get(field)
+            if isinstance(value, int) and value >= 0:
+                setattr(self, attribute, value)
 
     def _log_progress_locked(self, now: float) -> None:
         silence_ms = (
@@ -827,6 +883,9 @@ class SseTracker:
                 "terminal": self.terminal,
                 "response_id": self.response_id,
                 "model": self.model,
+                "input_tokens": self.input_tokens,
+                "output_tokens": self.output_tokens,
+                "total_tokens": self.total_tokens,
                 # 只有位于 SSE 事件边界时才能插入注释心跳。若上游刚好在一个
                 # data: 行中间停住，强行插入会破坏 JSON 和会话流。
                 "heartbeat_safe": not self.buffer,
@@ -1103,6 +1162,47 @@ def _target_url(settings: Settings, incoming_path: str, query: bytes) -> str:
         path = "/api/v1" + (incoming_path if incoming_path.startswith("/") else "/" + incoming_path)
     parsed = urlsplit(settings.upstream_origin)
     return urlunsplit((parsed.scheme, parsed.netloc, path, query.decode("latin-1"), ""))
+
+
+def _request_upload_mode(settings: Settings, method: str, body: bytes) -> str:
+    """选择上游请求体编码；只改变 HTTP framing，不改变 JSON 字节。"""
+    if not body or method.upper() in {"GET", "HEAD"}:
+        return "content-length"
+    if settings.request_upload_mode == "adaptive":
+        return (
+            "chunked"
+            if len(body) >= settings.chunked_threshold_bytes
+            else "content-length"
+        )
+    return settings.request_upload_mode
+
+
+def _request_content(
+    body: bytes,
+    upload_mode: str,
+    chunk_bytes: int,
+) -> bytes | Iterable[bytes]:
+    if upload_mode != "chunked":
+        return body
+
+    def chunks() -> Iterable[bytes]:
+        for offset in range(0, len(body), chunk_bytes):
+            yield body[offset : offset + chunk_bytes]
+
+    return chunks()
+
+
+def _retryable_preheader_error(exc: Exception) -> bool:
+    """匹配 OpenAI SDK 会重试的连接层故障，但不重试已收到的 HTTP 状态。"""
+    return isinstance(
+        exc,
+        (
+            httpx.NetworkError,
+            httpx.ProxyError,
+            httpx.RemoteProtocolError,
+            httpx.TimeoutException,
+        ),
+    )
 
 
 def _dns_snapshot(hostname: str) -> list[dict[str, Any]]:
@@ -1450,36 +1550,115 @@ def create_app(settings: Settings, diag: DiagnosticLogger) -> Flask:
                 body=_sanitized_body(parsed_body, settings.log_body_max_chars),
             )
         headers = _forward_headers(request.headers.items(), settings)
-        client, close_client = acquire_upstream_client()
-        try:
-            upstream_request = client.build_request(
-                request.method,
-                target,
-                headers=headers,
-                content=body,
-            )
+        upload_mode = _request_upload_mode(settings, request.method, body)
+        if upload_mode == "chunked":
             diag.emit(
-                logging.INFO,
-                "开始连接上游",
-                "开始建立到智谱的 HTTP 连接并等待响应头",
+                logging.WARNING,
+                "大请求启用分块上传",
+                "请求正文保持原始 JSON 字节，改用标准 HTTP/1.1 chunked framing",
                 request_id,
-                transport_profile=settings.transport_profile,
-                client_scope="shared" if not close_client else "per_request",
-                force_http1=settings.force_http1,
-                connection_close=settings.connection_close,
-                follow_redirects=settings.follow_redirects,
-                trust_env_proxy=settings.trust_env_proxy,
+                body_bytes=len(body),
+                threshold_bytes=settings.chunked_threshold_bytes,
+                upload_chunk_bytes=settings.upload_chunk_bytes,
             )
-            upstream = client.send(upstream_request, stream=True)
-        except Exception as exc:
-            _close_client_if_owned(client, close_client)
-            elapsed_ms = round((time.monotonic() - started) * 1000)
+
+        upstream: httpx.Response | None = None
+        client: httpx.Client | None = None
+        close_client = False
+        last_exc: Exception | None = None
+        attempts_total = 1 + settings.preheader_retries
+        attempt_index = 0
+        for attempt_index in range(attempts_total):
+            # 第一次使用 NVIDIA 风格共享池；发生连接层故障后改用全新客户端，
+            # 避免再次取到已被显式代理关闭的 TLS tunnel。
+            if attempt_index == 0:
+                client, close_client = acquire_upstream_client()
+            else:
+                client, close_client = _http_client(settings), True
+                delay = settings.retry_backoff_seconds * (2 ** (attempt_index - 1))
+                if delay > 0:
+                    time.sleep(delay)
+            try:
+                upstream_request = client.build_request(
+                    request.method,
+                    target,
+                    headers=headers,
+                    content=_request_content(
+                        body,
+                        upload_mode,
+                        settings.upload_chunk_bytes,
+                    ),
+                )
+                diag.emit(
+                    logging.INFO,
+                    "开始连接上游" if attempt_index == 0 else "重试连接上游",
+                    "开始建立到智谱的 HTTP 连接并等待响应头",
+                    request_id,
+                    attempt=attempt_index + 1,
+                    attempts_total=attempts_total,
+                    transport_profile=settings.transport_profile,
+                    client_scope="shared" if not close_client else "fresh_per_attempt",
+                    upload_mode=upload_mode,
+                    body_bytes=len(body),
+                    force_http1=settings.force_http1,
+                    connection_close=settings.connection_close,
+                    follow_redirects=settings.follow_redirects,
+                    trust_env_proxy=settings.trust_env_proxy,
+                )
+                upstream = client.send(upstream_request, stream=True)
+                if attempt_index > 0:
+                    diag.emit(
+                        logging.INFO,
+                        "全新连接重试成功",
+                        "连接层异常后已通过全新 TLS 连接收到智谱响应头",
+                        request_id,
+                        successful_attempt=attempt_index + 1,
+                        previous_failures=attempt_index,
+                        upload_mode=upload_mode,
+                    )
+                break
+            except Exception as exc:
+                last_exc = exc
+                _close_client_if_owned(client, close_client)
+                retryable = _retryable_preheader_error(exc)
+                has_next = retryable and attempt_index + 1 < attempts_total
+                diag.emit(
+                    logging.WARNING if has_next else logging.ERROR,
+                    "上游连接失败准备重试" if has_next else "上游连接失败",
+                    (
+                        "尚未收到响应头；将丢弃当前连接并使用全新 TLS 连接重试"
+                        if has_next
+                        else "尚未收到智谱响应头，连接/发送请求即失败"
+                    ),
+                    request_id,
+                    attempt=attempt_index + 1,
+                    attempts_total=attempts_total,
+                    retryable=retryable,
+                    upload_mode=upload_mode,
+                    body_bytes=len(body),
+                    elapsed_ms=round((time.monotonic() - started) * 1000),
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                if not has_next:
+                    break
+
+        if upstream is None:
+            exc = last_exc or RuntimeError("未知上游连接错误")
+            large_request = len(body) >= settings.chunked_threshold_bytes
+            attempts_used = attempt_index + 1
             diag.emit(
                 logging.ERROR,
-                "上游连接失败",
-                "尚未收到智谱响应头，连接/发送请求即失败",
+                "大请求持续被代理链路切断" if large_request else "上游连接最终失败",
+                (
+                    "大请求在全新连接重试后仍未收到响应头；疑似企业代理的请求体或内容检查"
+                    if large_request
+                    else "所有预响应头连接尝试均失败"
+                ),
                 request_id,
-                elapsed_ms=elapsed_ms,
+                attempts=attempts_used,
+                upload_mode=upload_mode,
+                body_bytes=len(body),
+                threshold_bytes=settings.chunked_threshold_bytes,
                 error=f"{type(exc).__name__}: {exc}",
                 dns=_dns_snapshot(parsed_target.hostname or ""),
             )
@@ -1490,9 +1669,14 @@ def create_app(settings: Settings, diag: DiagnosticLogger) -> Flask:
                         "message": "本地代理连接智谱失败",
                         "request_id": request_id,
                         "detail": f"{type(exc).__name__}: {exc}",
+                        "attempts": attempts_used,
+                        "upload_mode": upload_mode,
+                        "body_bytes": len(body),
                     }
                 }
             ), 502, {"X-Local-Proxy-Request-ID": request_id}
+
+        assert client is not None
 
         header_ms = round((time.monotonic() - started) * 1000)
         transport = _transport_details(upstream)
@@ -1503,6 +1687,8 @@ def create_app(settings: Settings, diag: DiagnosticLogger) -> Flask:
             f"智谱返回 HTTP {upstream.status_code}",
             request_id,
             elapsed_ms=header_ms,
+            attempts_used=attempt_index + 1,
+            upload_mode=upload_mode,
             status=upstream.status_code,
             trace_headers=traces,
             transport=transport,

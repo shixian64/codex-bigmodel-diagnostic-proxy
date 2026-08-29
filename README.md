@@ -8,7 +8,8 @@ Codex ──HTTP/SSE──> 127.0.0.1:8765 ──HTTP/SSE──> https://open.bi
 
 它不把 Responses API 转换为 Chat Completions，也不管理 Codex session。主要用途是：
 
-- 默认使用与 `codex-nvidia-proxy` / OpenAI SDK 相同风格的共享 HTTP/1.1 客户端和 keep-alive 连接池；
+- 默认使用与 `codex-nvidia-proxy` / OpenAI SDK 相同风格的共享 HTTP/1.1 客户端、keep-alive 连接池和两次预响应头重试；
+- 请求达到 `90000` 字节时自动改用 HTTP/1.1 chunked framing，正文 JSON 字节完全不变；
 - Responses 请求及 SSE 事件仍透明转发，不转换为 Chat Completions；
 - 可切换回旧版 `isolated` 每请求新连接模式做对照；
 - 上游静默时，向本机 Codex 发送 SSE 注释心跳；
@@ -29,11 +30,11 @@ Codex ──HTTP/SSE──> 127.0.0.1:8765 ──HTTP/SSE──> https://open.bi
 - 只有重启时正在生成的那一轮会中断，之前已完成的上下文不受影响；
 - 发生半途断流时，当前轮会明确失败，需要重发，但不会清空此前会话。
 
-需要注意：若上游已执行了请求却在返回途中断开，Codex 无法确认当前轮是否完成；重发可能产生另一份回答，涉及工具调用时也可能造成重复副作用。因此代理不会自动重发上游请求，诊断阶段也建议把 `stream_max_retries` 设为 `0`。
+需要注意：若上游已执行了请求却在返回途中断开，Codex 无法确认当前轮是否完成；重发可能产生另一份回答，涉及工具调用时也可能造成重复副作用。因此代理只复刻 NVIDIA/OpenAI SDK 的“收到响应头之前最多重试两次”，且每次使用全新 TLS 连接；一旦收到响应头或部分 SSE，绝不自动重发。可将 `BIGMODEL_PREHEADER_RETRIES=0` 完全关闭代理重试。
 
 ## 为什么界面恰好重连 5 次？
 
-Codex 自定义模型提供商的 `stream_max_retries` 默认值就是 5。它说明 Codex 没有看到完整的 SSE 终止事件，不能单独证明是奇安信、智谱还是其他网关导致。
+Codex 自定义模型提供商默认 `request_max_retries=4`、`stream_max_retries=5`。前者会让响应头之前的故障总共尝试五次，后者用于 SSE 中断重连；界面出现五次不能单独证明是奇安信、智谱还是其他网关导致。
 
 本代理会把故障进一步分成：
 
@@ -66,11 +67,14 @@ notepad .env
 
 ```text
 BIGMODEL_TRANSPORT_PROFILE=nvidia
+BIGMODEL_PREHEADER_RETRIES=2
+BIGMODEL_REQUEST_UPLOAD_MODE=adaptive
+BIGMODEL_CHUNKED_THRESHOLD_BYTES=90000
 BIGMODEL_LOCAL_HEARTBEAT=10
 BIGMODEL_LOG_BODY=0
 ```
 
-`nvidia` 模式只复刻 NVIDIA 项目使用的连接层：共享客户端、HTTP/1.1、keep-alive、系统代理环境。协议仍是智谱原生 Responses，不做格式转换。要对照旧行为时改为：
+`nvidia` 模式只复刻 NVIDIA 项目使用的连接层：共享客户端、HTTP/1.1、keep-alive、系统代理环境和预响应头重试。协议仍是智谱原生 Responses，不做格式转换。`adaptive` 会在大请求上改用标准 chunked framing；它只改变 HTTP 传输分块，不删除、压缩或重写上下文。要对照旧行为时改为：
 
 ```text
 BIGMODEL_TRANSPORT_PROFILE=isolated
@@ -131,6 +135,11 @@ Codex Base URL: http://127.0.0.1:8765/api/v1
 参考 `codex-provider.example.toml`，把原来的智谱 Provider 改为：
 
 ```toml
+model_provider = "ZAI_LOCAL_DIAG"
+
+# 顶层配置，必须写在下面的 provider 表之前。
+model_auto_compact_token_limit = 18000
+
 [model_providers.ZAI_LOCAL_DIAG]
 name = "智谱（本地诊断代理）"
 base_url = "http://127.0.0.1:8765/api/v1"
@@ -141,15 +150,13 @@ stream_max_retries = 0
 stream_idle_timeout_ms = 600000
 ```
 
-`model_provider` 同时改为：
-
-```toml
-model_provider = "ZAI_LOCAL_DIAG"
-```
-
 关闭所有 Codex 窗口后重新启动。原有会话不会被删除。
 
-诊断阶段把 `request_max_retries` 和 `stream_max_retries` 都设为 `0`，让一次故障只产生一条上游请求并保留最清晰的证据。实测即使代理合成了 `response.failed`，Codex 仍会按流重试参数重新请求；中间层无权覆盖客户端策略。链路稳定后可以再按需调高。
+把 Codex 的 `request_max_retries` 和 `stream_max_retries` 都设为 `0`，由本地代理统一处理两次“预响应头全新连接重试”，避免 Codex 默认五次重试形成请求风暴。`model_auto_compact_token_limit=18000` 会在历史继续增长前让 Codex 自动总结上下文；它不清空任务，但非常旧的细节会被摘要替代。
+
+`model_auto_compact_token_limit` 的定义见 [Codex 官方配置参考](https://developers.openai.com/codex/config-reference/)；它是 Token 阈值，不是字节数。
+
+已有请求体已经超过企业代理阈值的旧任务，第一次压缩请求本身也可能无法上传。此时先新建任务并带入一份简短总结；以后由自动压缩阈值提前处理。
 
 发出 Codex 消息后，代理控制台必须出现 `请求开始`。如果控制台只有“代理启动/网络快照”，但 Codex 已显示 504，说明该请求没有经过本地代理；优先检查活动 Provider、`base_url`、Codex 是否完全重启，以及 `NO_PROXY`。
 
@@ -194,6 +201,18 @@ py -3 .\bigmodel_diagnostic_proxy.py pack
 
 未收到智谱 HTTP 响应头。优先检查 DNS、TLS 证书、显式代理和安全软件日志。
 
+### `上游连接失败准备重试` / `全新连接重试成功`
+
+共享连接池中的 TLS tunnel 已被企业代理提前关闭。代理会丢弃本次连接，按 NVIDIA/OpenAI SDK 行为使用全新连接重试；日志记录具体尝试序号。
+
+### `大请求启用分块上传`
+
+请求达到配置阈值，代理保持原始 JSON 字节不变，改用 HTTP/1.1 chunked framing，避免固定 `Content-Length` 请求触发中间设备缓冲边界。
+
+### `大请求持续被代理链路切断`
+
+分块上传和全新连接重试仍未收到任何响应头。这更接近企业代理的内容/DLP策略，而不是 keep-alive 或 SSE 静默问题；应依靠提前自动压缩、减少不需要的 MCP 工具，或申请网络侧放行。
+
 ### `上游静默`
 
 已建立 SSE，但一段时间没有新字节。代理会向 Codex 发本地注释心跳；这只能保持 `Codex → 本地代理`，不能修复 `本地代理 → 智谱` 的断链。
@@ -224,7 +243,8 @@ py -3 .\bigmodel_diagnostic_proxy.py pack
 
 ## 重要限制
 
-- 代理不会在收到部分输出后自动重发请求，避免重复生成或重复工具调用。
+- 代理只在尚未收到响应头时自动重试；收到任何响应头或部分输出后绝不重发，避免重复工具调用。
+- 预响应头重试仍存在“上游已收到请求但响应头丢失”的小概率重复计费风险，可用 `BIGMODEL_PREHEADER_RETRIES=0` 关闭。
 - 本地 SSE 心跳无法阻止企业网关切断上游 TCP；它的价值是隔离两段链路并留下证据。
 - 如果目标机证明确实只拦截长 SSE，后续可在此项目上增加“上游非流式、下游重放 SSE”的兼容模式；第一版不盲目改写协议。
 - 只允许绑定回环地址（`127.0.0.1` / `localhost` / `::1`），代码会拒绝局域网或公网监听。
@@ -256,4 +276,4 @@ py -3 .\bigmodel_diagnostic_proxy.py pack
 py -3 .\self_test.py
 ```
 
-当前自检覆盖：正常完成、事件间静默心跳、半事件静默、提前 EOF、读取异常、401/429/503、504 内容过滤分类、NVIDIA/isolated 两种传输模式、无 API Key HTTP 探测、普通响应、压缩 SSE、客户端主动断开、日志脱敏和 Waitress 参数兼容性。
+当前自检覆盖：正常完成、上下文正文透明性、大请求 chunked 上传、预响应头全新连接重试、事件间静默心跳、半事件静默、提前 EOF、读取异常、401/429/503、504 内容过滤分类、NVIDIA/isolated 两种传输模式、无 API Key HTTP 探测、普通响应、压缩 SSE、Token 用量记录、客户端主动断开、日志脱敏和 Waitress 参数兼容性。
