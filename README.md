@@ -76,6 +76,8 @@ BIGMODEL_LOG_BODY=0
 .\start.ps1
 ```
 
+两个 PowerShell 脚本均使用带 BOM 的 UTF-8 保存，以兼容 Windows PowerShell 5.1 对中文脚本的读取规则。
+
 看到以下地址即为成功：
 
 ```text

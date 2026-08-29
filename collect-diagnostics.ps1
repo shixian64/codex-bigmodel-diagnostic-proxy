@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Continue"
+﻿$ErrorActionPreference = "Continue"
 Set-Location -LiteralPath $PSScriptRoot
 
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"

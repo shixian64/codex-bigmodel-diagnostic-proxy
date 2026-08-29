@@ -40,7 +40,7 @@ from flask import Flask, Response, jsonify, request, send_file
 from werkzeug.datastructures import Headers
 
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 BASE_DIR = Path(__file__).resolve().parent
 
 

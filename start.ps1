@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 Set-Location -LiteralPath $PSScriptRoot
 
 # 保证中文控制台和重定向日志统一使用 UTF-8。
