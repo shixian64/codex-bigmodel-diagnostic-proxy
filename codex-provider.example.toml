@@ -1,0 +1,18 @@
+# 把这一段合并到 Windows 的 C:\Users\<用户名>\.codex\config.toml。
+# API Key 仍由 Codex 持有；本地代理不保存 Key，只透明转发 Authorization。
+
+model_provider = "ZAI_LOCAL_DIAG"
+model = "glm-5.3"
+model_reasoning_effort = "max"
+model_catalog_json = "~/.codex/models.json"
+
+[model_providers.ZAI_LOCAL_DIAG]
+name = "智谱（本地诊断代理）"
+base_url = "http://127.0.0.1:8765/api/v1"
+experimental_bearer_token = "<Your API Key>"
+wire_api = "responses"
+
+# 诊断阶段避免一次故障被放大成重复请求。稳定后可按需调高。
+request_max_retries = 1
+stream_max_retries = 0
+stream_idle_timeout_ms = 600000
