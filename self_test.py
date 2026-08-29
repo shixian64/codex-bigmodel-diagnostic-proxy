@@ -98,6 +98,19 @@ class MockUpstream(BaseHTTPRequestHandler):
             self.wfile.write(payload)
             return
 
+        if scenario == "content_filter":
+            payload = (
+                b"<html><head><title>Content Filter - Access Denied</title></head>"
+                b"<body><h1>504 Gateway Timeout</h1></body></html>"
+            )
+            self._headers(
+                504,
+                "text/html; charset=utf-8",
+                Content_Length=str(len(payload)),
+            )
+            self.wfile.write(payload)
+            return
+
         if scenario == "generic":
             payload = b'{"ok":true}'
             self._headers(200, "application/json", Content_Length=str(len(payload)))
@@ -270,7 +283,9 @@ def run_self_test(keep_logs: bool = False) -> int:
         )
         check(lower_headers.get("cookie") == "session=SELF_TEST_COOKIE_SECRET", "Cookie 未透明转发")
         check(lower_headers.get("accept-encoding") == "identity", "未强制 identity 编码")
-        check(lower_headers.get("connection", "").lower() == "close", "未请求关闭上游连接")
+        check(lower_headers.get("connection", "").lower() != "close", "NVIDIA 模式误发 Connection: close")
+        check(settings.transport_profile == "nvidia", "自检没有使用 NVIDIA 兼容传输模式")
+        check(settings.reuse_upstream_client is True, "NVIDIA 模式没有复用共享客户端")
 
     record("上下文正文和请求头透明转发", forwarding)
 
@@ -320,6 +335,30 @@ def run_self_test(keep_logs: bool = False) -> int:
 
     record("401/429/503 原样返回", http_errors)
 
+    def content_filter_classification() -> None:
+        response = post("/api/v1/responses?scenario=content_filter")
+        check(response.status_code == 504, "内容过滤器 504 状态未原样返回")
+        check(b"Content Filter - Access Denied" in response.content, "内容过滤拒绝页被修改")
+        check(
+            any(item["event"] == "疑似企业代理内容过滤拒绝" for item in diag.tail(2000)),
+            "没有生成企业内容过滤分类日志",
+        )
+
+    record("504 Content Filter 分类", content_filter_classification)
+
+    def isolated_headers() -> None:
+        isolated = replace(
+            settings,
+            transport_profile="isolated",
+            connection_close=True,
+            reuse_upstream_client=False,
+            follow_redirects=False,
+        )
+        forwarded = proxy._forward_headers({"Accept": "text/event-stream"}.items(), isolated)
+        check(forwarded.get("Connection") == "close", "isolated 模式没有关闭连接复用")
+
+    record("isolated 每请求新连接模式", isolated_headers)
+
     def generic_and_gzip() -> None:
         generic = post("/api/v1/models?scenario=generic")
         check(generic.json() == {"ok": True}, "普通 JSON 响应转发失败")
@@ -338,7 +377,15 @@ def run_self_test(keep_logs: bool = False) -> int:
             content=request_body,
         )
         response = client.send(upstream_request, stream=True)
-        relay = proxy._sse_relay(response, client, diag, settings, "selftest_disconnect", "glm-test")
+        relay = proxy._sse_relay(
+            response,
+            client,
+            True,
+            diag,
+            settings,
+            "selftest_disconnect",
+            "glm-test",
+        )
         first = next(relay)
         check(b"response.created" in first, "断开测试未收到首事件")
         relay.close()
@@ -385,6 +432,14 @@ def run_self_test(keep_logs: bool = False) -> int:
 
     record("Waitress 启动参数兼容性", waitress_options)
 
+    def configured_http_probe() -> None:
+        result = proxy._configured_http_probe(settings, diag)
+        check(result.get("ok") is True, f"启动 HTTP 探测失败：{result}")
+        check(result.get("status") == 200, "启动 HTTP 探测状态异常")
+        check(result.get("transport", {}).get("http_version") == "HTTP/1.1", "启动探测未使用 HTTP/1.1")
+
+    record("启动无 API Key HTTP 探测", configured_http_probe)
+
     print("\nCodex 智谱诊断代理本地自检")
     print("=" * 48)
     for name, ok, detail in results:
@@ -398,6 +453,9 @@ def run_self_test(keep_logs: bool = False) -> int:
     local_thread.join(timeout=2.0)
     upstream.shutdown()
     upstream.server_close()
+    shared_client = app.extensions.get("bigmodel_shared_upstream_client")
+    if shared_client is not None:
+        shared_client.close()
     if keep_logs:
         destination = Path.cwd() / "logs" / f"self-test-{time.strftime('%Y%m%d-%H%M%S')}"
         destination.parent.mkdir(parents=True, exist_ok=True)

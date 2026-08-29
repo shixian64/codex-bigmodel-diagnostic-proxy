@@ -24,7 +24,12 @@ function Protect-DiagnosticLine([string]$Line) {
 $system = Join-Path $work "system.txt"
 Write-Section $system "时间" { Get-Date -Format o }
 Write-Section $system "Windows" { Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,BuildNumber,OSArchitecture }
-Write-Section $system "Python" { python --version }
+Write-Section $system "Python" {
+    $py = Get-Command py -ErrorAction SilentlyContinue
+    if ($py) { & $py.Source -3 --version }
+    $python = Get-Command python -ErrorAction SilentlyContinue
+    if ($python) { & $python.Source --version }
+}
 Write-Section $system "Codex" { codex --version }
 Write-Section $system "WinHTTP 代理" { netsh winhttp show proxy }
 Write-Section $system "显式代理环境（值已隐藏）" {
@@ -44,6 +49,13 @@ Write-Section $network "API 无鉴权探测" {
     curl.exe -sS -D - -o NUL --connect-timeout 15 --max-time 30 "https://open.bigmodel.cn/api/v1/models" |
         ForEach-Object { Protect-DiagnosticLine $_ }
 }
+Write-Section $network "API 强制直连探测（忽略显式代理）" {
+    curl.exe --noproxy "*" -sS -D - -o NUL --connect-timeout 15 --max-time 30 "https://open.bigmodel.cn/api/v1/models" |
+        ForEach-Object { Protect-DiagnosticLine $_ }
+}
+Write-Section $network "本地代理健康检查（强制 NO_PROXY）" {
+    curl.exe --noproxy "*" -sS --connect-timeout 3 --max-time 5 "http://127.0.0.1:8765/healthz"
+}
 Write-Section $network "IPv4 默认/198.18 路由" {
     Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue |
         Where-Object { $_.DestinationPrefix -eq '0.0.0.0/0' -or $_.DestinationPrefix -like '198.18*' } |
@@ -62,8 +74,25 @@ if (Test-Path -LiteralPath $config) {
     "未找到 $config" | Out-File -FilePath $configOut -Encoding utf8
 }
 
-$python = if (Test-Path ".\.venv\Scripts\python.exe") { ".\.venv\Scripts\python.exe" } else { "python" }
-& $python ".\bigmodel_diagnostic_proxy.py" pack
+$pythonCommand = $null
+$pythonPrefixArgs = @()
+if (Test-Path ".\.venv\Scripts\python.exe") {
+    $pythonCommand = (Resolve-Path ".\.venv\Scripts\python.exe").Path
+} else {
+    $py = Get-Command py -ErrorAction SilentlyContinue
+    if ($py) {
+        $pythonCommand = $py.Source
+        $pythonPrefixArgs = @("-3")
+    } else {
+        $python = Get-Command python -ErrorAction SilentlyContinue
+        if ($python) { $pythonCommand = $python.Source }
+    }
+}
+if ($pythonCommand) {
+    & $pythonCommand @pythonPrefixArgs ".\bigmodel_diagnostic_proxy.py" pack
+} else {
+    "未找到 Python，跳过代理日志打包命令。" | Out-File -FilePath $system -Encoding utf8 -Append
+}
 
 $zip = Join-Path $PSScriptRoot "logs\windows-diagnostics-$stamp.zip"
 Compress-Archive -Path "$work\*" -DestinationPath $zip -Force

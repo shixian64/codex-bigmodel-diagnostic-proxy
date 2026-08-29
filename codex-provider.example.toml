@@ -13,6 +13,6 @@ experimental_bearer_token = "<Your API Key>"
 wire_api = "responses"
 
 # 诊断阶段避免一次故障被放大成重复请求。稳定后可按需调高。
-request_max_retries = 1
+request_max_retries = 0
 stream_max_retries = 0
 stream_idle_timeout_ms = 600000

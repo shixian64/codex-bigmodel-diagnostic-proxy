@@ -40,7 +40,7 @@ from flask import Flask, Response, jsonify, request, send_file
 from werkzeug.datastructures import Headers
 
 
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.3.0"
 BASE_DIR = Path(__file__).resolve().parent
 
 
@@ -96,8 +96,11 @@ class Settings:
     log_body_max_chars: int = 6000
     log_max_mb: int = 20
     log_backup_count: int = 8
+    transport_profile: str = "nvidia"
     force_http1: bool = True
-    connection_close: bool = True
+    connection_close: bool = False
+    reuse_upstream_client: bool = True
+    follow_redirects: bool = True
     trust_env_proxy: bool = True
     insecure_skip_verify: bool = False
     ca_bundle: str = ""
@@ -142,6 +145,14 @@ class Settings:
                 "BIGMODEL_UPSTREAM_ORIGIN 只填写站点根地址；请用 "
                 "https://open.bigmodel.cn，不要附加 /api/v1"
             )
+        transport_profile = os.environ.get(
+            "BIGMODEL_TRANSPORT_PROFILE", "nvidia"
+        ).strip().lower()
+        if transport_profile not in {"nvidia", "isolated"}:
+            raise ValueError(
+                "BIGMODEL_TRANSPORT_PROFILE 只能是 nvidia 或 isolated"
+            )
+        nvidia_profile = transport_profile == "nvidia"
         return cls(
             bind_host=bind_host,
             bind_port=_env_int("BIGMODEL_PROXY_PORT", 8765, 1, 65535),
@@ -152,8 +163,19 @@ class Settings:
             log_body_max_chars=_env_int("BIGMODEL_LOG_BODY_MAX_CHARS", 6000, 500, 100000),
             log_max_mb=_env_int("BIGMODEL_LOG_MAX_MB", 20, 1, 1024),
             log_backup_count=_env_int("BIGMODEL_LOG_BACKUPS", 8, 1, 100),
-            force_http1=_env_bool("BIGMODEL_FORCE_HTTP1", True),
-            connection_close=_env_bool("BIGMODEL_CONNECTION_CLOSE", True),
+            transport_profile=transport_profile,
+            force_http1=True
+            if nvidia_profile
+            else _env_bool("BIGMODEL_FORCE_HTTP1", True),
+            connection_close=False
+            if nvidia_profile
+            else _env_bool("BIGMODEL_CONNECTION_CLOSE", True),
+            reuse_upstream_client=True
+            if nvidia_profile
+            else _env_bool("BIGMODEL_REUSE_UPSTREAM_CLIENT", False),
+            follow_redirects=True
+            if nvidia_profile
+            else _env_bool("BIGMODEL_FOLLOW_REDIRECTS", False),
             trust_env_proxy=_env_bool("BIGMODEL_TRUST_ENV_PROXY", True),
             insecure_skip_verify=_env_bool("BIGMODEL_INSECURE_SKIP_VERIFY", False),
             ca_bundle=os.environ.get("BIGMODEL_CA_BUNDLE", "").strip(),
@@ -394,6 +416,30 @@ def _socket_options() -> list[tuple[int, int, int]]:
 
 def _http_client(settings: Settings) -> httpx.Client:
     read_timeout: float | None = settings.read_timeout_seconds or None
+    timeout = httpx.Timeout(
+        connect=settings.connect_timeout_seconds,
+        read=read_timeout,
+        write=settings.write_timeout_seconds,
+        pool=settings.pool_timeout_seconds,
+    )
+    if settings.transport_profile == "nvidia":
+        # codex-nvidia-proxy 使用 OpenAI SDK 的默认同步客户端。其核心行为是：
+        # HTTP/1.1、共享线程安全连接池、允许 keep-alive、继承代理环境。
+        # 此处仍做 Responses 字节透明转发，只复刻连接层，不引入格式转换。
+        return httpx.Client(
+            verify=_ssl_context(settings),
+            timeout=timeout,
+            trust_env=settings.trust_env_proxy,
+            http1=True,
+            http2=False,
+            follow_redirects=settings.follow_redirects,
+            limits=httpx.Limits(
+                max_connections=1000,
+                max_keepalive_connections=100,
+                keepalive_expiry=5.0,
+            ),
+        )
+
     limits = httpx.Limits(
         max_connections=64,
         max_keepalive_connections=0 if settings.connection_close else 16,
@@ -408,17 +454,11 @@ def _http_client(settings: Settings) -> httpx.Client:
         retries=0,
         socket_options=_socket_options(),
     )
-    timeout = httpx.Timeout(
-        connect=settings.connect_timeout_seconds,
-        read=read_timeout,
-        write=settings.write_timeout_seconds,
-        pool=settings.pool_timeout_seconds,
-    )
     return httpx.Client(
         transport=transport,
         timeout=timeout,
         trust_env=settings.trust_env_proxy,
-        follow_redirects=False,
+        follow_redirects=settings.follow_redirects,
     )
 
 
@@ -469,7 +509,7 @@ def _sanitized_body(data: Any, max_chars: int) -> str:
     return _redact_text(text)
 
 
-def _error_body_summary(body: bytes) -> dict[str, Any]:
+def _error_body_summary(body: bytes, status: int | None = None) -> dict[str, Any]:
     """提取足够定位 401/429/WAF 的错误信息，但不把完整响应正文写入日志。"""
     result: dict[str, Any] = {
         "body_bytes": len(body),
@@ -483,6 +523,17 @@ def _error_body_summary(body: bytes) -> dict[str, Any]:
         result["format"] = "text_or_html"
         result["preview"] = _redact_text(text[:1200])
         result["truncated"] = len(text) > 1200 or len(body) > 32768
+        lowered = text.lower()
+        if "content filter" in lowered and "access denied" in lowered:
+            result["classification"] = "enterprise_proxy_content_filter_denied"
+            result["diagnosis_cn"] = (
+                "疑似企业显式代理/内容过滤器拒绝；不是智谱 Responses JSON 错误"
+            )
+        elif status == 504 and any(
+            marker in lowered for marker in ("proxy", "gateway timeout", "access denied")
+        ):
+            result["classification"] = "gateway_or_proxy_timeout"
+            result["diagnosis_cn"] = "疑似中间网关或显式代理超时"
         return result
 
     result["format"] = "json"
@@ -833,9 +884,19 @@ def _queue_put(
     return False
 
 
+def _close_client_if_owned(client: httpx.Client, close_client: bool) -> None:
+    if not close_client:
+        return
+    try:
+        client.close()
+    except Exception:
+        pass
+
+
 def _sse_relay(
     response: httpx.Response,
     client: httpx.Client,
+    close_client: bool,
     diag: DiagnosticLogger,
     settings: Settings,
     request_id: str,
@@ -866,10 +927,7 @@ def _sse_relay(
                 response.close()
             except Exception:
                 pass
-            try:
-                client.close()
-            except Exception:
-                pass
+            _close_client_if_owned(client, close_client)
 
     producer = threading.Thread(
         target=read_upstream,
@@ -983,16 +1041,14 @@ def _sse_relay(
             response.close()
         except Exception:
             pass
-        try:
-            client.close()
-        except Exception:
-            pass
+        _close_client_if_owned(client, close_client)
         producer.join(timeout=1.5)
 
 
 def _generic_relay(
     response: httpx.Response,
     client: httpx.Client,
+    close_client: bool,
     diag: DiagnosticLogger,
     request_id: str,
 ) -> Iterable[bytes]:
@@ -1035,10 +1091,7 @@ def _generic_relay(
             response.close()
         except Exception:
             pass
-        try:
-            client.close()
-        except Exception:
-            pass
+        _close_client_if_owned(client, close_client)
 
 
 def _target_url(settings: Settings, incoming_path: str, query: bytes) -> str:
@@ -1083,17 +1136,90 @@ def _proxy_env_snapshot() -> dict[str, Any]:
             result[name] = {"present": False}
             continue
         if name == "NO_PROXY":
-            result[name] = {"present": True, "entry_count": len(value.split(","))}
+            entries = [item.strip().lower() for item in value.split(",") if item.strip()]
+            loopback_names = {"127.0.0.1", "localhost", "::1", "[::1]", "*"}
+            result[name] = {
+                "present": True,
+                "entry_count": len(entries),
+                "loopback_covered": any(item in loopback_names for item in entries),
+            }
             continue
-        parsed = urlsplit(value if "://" in value else "http://" + value)
-        result[name] = {
-            "present": True,
-            "scheme": parsed.scheme,
-            "host": parsed.hostname,
-            "port": parsed.port,
-            "has_credentials": bool(parsed.username or parsed.password),
-        }
+        try:
+            parsed = urlsplit(value if "://" in value else "http://" + value)
+            result[name] = {
+                "present": True,
+                "scheme": parsed.scheme,
+                "host": parsed.hostname,
+                "port": parsed.port,
+                "userinfo_present": bool(parsed.username or parsed.password),
+            }
+        except Exception as exc:
+            result[name] = {
+                "present": True,
+                "parse_ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
     return result
+
+
+def _configured_http_probe(settings: Settings, diag: DiagnosticLogger) -> dict[str, Any]:
+    """不带 API Key，经当前 httpx/代理配置探测模型端点。"""
+    target = settings.upstream_origin + "/api/v1/models"
+    started = time.monotonic()
+    client = _http_client(settings)
+    try:
+        response = client.get(
+            target,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": f"codex-bigmodel-diagnostic-proxy/{APP_VERSION}",
+            },
+            timeout=30.0,
+        )
+        body = response.content
+        summary = _error_body_summary(body, response.status_code)
+        result = {
+            "ok": response.status_code < 500,
+            "status": response.status_code,
+            "elapsed_ms": round((time.monotonic() - started) * 1000),
+            "trace_headers": _trace_headers(response.headers),
+            "transport": _transport_details(response),
+            "body_summary": summary,
+        }
+        proxy_denied = (
+            summary.get("classification")
+            == "enterprise_proxy_content_filter_denied"
+        )
+        diag.emit(
+            logging.ERROR if response.status_code >= 500 or proxy_denied else logging.INFO,
+            "启动HTTP探测被内容过滤拒绝" if proxy_denied else "启动HTTP探测完成",
+            (
+                "无 API Key 的 GET 探测收到 Content Filter - Access Denied"
+                if proxy_denied
+                else f"无 API Key 的 GET 探测返回 HTTP {response.status_code}"
+            ),
+            status=response.status_code,
+            elapsed_ms=result["elapsed_ms"],
+            trace_headers=result["trace_headers"],
+            transport=result["transport"],
+            body_summary=summary,
+        )
+        return result
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "elapsed_ms": round((time.monotonic() - started) * 1000),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        diag.emit(
+            logging.ERROR,
+            "启动HTTP探测失败",
+            "无 API Key 的 GET 探测在收到 HTTP 响应前失败",
+            **result,
+        )
+        return result
+    finally:
+        client.close()
 
 
 def run_startup_probe(settings: Settings, diag: DiagnosticLogger) -> dict[str, Any]:
@@ -1114,6 +1240,19 @@ def run_startup_probe(settings: Settings, diag: DiagnosticLogger) -> dict[str, A
         dns=result["dns"],
         proxy_env=result["proxy_env"],
     )
+    proxy_is_present = any(
+        result["proxy_env"].get(name, {}).get("present")
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")
+    )
+    no_proxy_state = result["proxy_env"].get("NO_PROXY", {})
+    if proxy_is_present and not no_proxy_state.get("loopback_covered"):
+        diag.emit(
+            logging.WARNING,
+            "NO_PROXY缺少回环地址",
+            "检测到显式代理，但 NO_PROXY 未覆盖回环地址；同一环境启动的 Codex 可能把本地请求误发给企业代理",
+            proxy_env=result["proxy_env"],
+        )
+    result["http_via_configured_transport"] = _configured_http_probe(settings, diag)
     if parsed.scheme != "https":
         result["tls"] = {"skipped": "上游不是 HTTPS"}
         return result
@@ -1232,6 +1371,15 @@ def create_app(settings: Settings, diag: DiagnosticLogger) -> Flask:
     app.config["JSON_AS_ASCII"] = False
     app.json.ensure_ascii = False
     probe_holder: dict[str, Any] = {"value": None}
+    shared_upstream_client = (
+        _http_client(settings) if settings.reuse_upstream_client else None
+    )
+    app.extensions["bigmodel_shared_upstream_client"] = shared_upstream_client
+
+    def acquire_upstream_client() -> tuple[httpx.Client, bool]:
+        if shared_upstream_client is not None:
+            return shared_upstream_client, False
+        return _http_client(settings), True
 
     @app.get("/")
     def index() -> Response:
@@ -1302,7 +1450,7 @@ def create_app(settings: Settings, diag: DiagnosticLogger) -> Flask:
                 body=_sanitized_body(parsed_body, settings.log_body_max_chars),
             )
         headers = _forward_headers(request.headers.items(), settings)
-        client = _http_client(settings)
+        client, close_client = acquire_upstream_client()
         try:
             upstream_request = client.build_request(
                 request.method,
@@ -1315,13 +1463,16 @@ def create_app(settings: Settings, diag: DiagnosticLogger) -> Flask:
                 "开始连接上游",
                 "开始建立到智谱的 HTTP 连接并等待响应头",
                 request_id,
+                transport_profile=settings.transport_profile,
+                client_scope="shared" if not close_client else "per_request",
                 force_http1=settings.force_http1,
                 connection_close=settings.connection_close,
+                follow_redirects=settings.follow_redirects,
                 trust_env_proxy=settings.trust_env_proxy,
             )
             upstream = client.send(upstream_request, stream=True)
         except Exception as exc:
-            client.close()
+            _close_client_if_owned(client, close_client)
             elapsed_ms = round((time.monotonic() - started) * 1000)
             diag.emit(
                 logging.ERROR,
@@ -1368,14 +1519,23 @@ def create_app(settings: Settings, diag: DiagnosticLogger) -> Flask:
                 error_body = f"读取错误响应失败：{type(exc).__name__}: {exc}".encode("utf-8")
             finally:
                 upstream.close()
-                client.close()
+                _close_client_if_owned(client, close_client)
+            error_summary = _error_body_summary(error_body, upstream.status_code)
+            proxy_denied = (
+                error_summary.get("classification")
+                == "enterprise_proxy_content_filter_denied"
+            )
             diag.emit(
                 logging.ERROR,
-                "上游HTTP错误",
-                f"智谱返回 HTTP {upstream.status_code}，已记录脱敏后的错误摘要",
+                "疑似企业代理内容过滤拒绝" if proxy_denied else "上游HTTP错误",
+                (
+                    "收到 Content Filter - Access Denied 页面；错误由企业代理/过滤器生成"
+                    if proxy_denied
+                    else f"智谱返回 HTTP {upstream.status_code}，已记录脱敏后的错误摘要"
+                ),
                 request_id,
                 status=upstream.status_code,
-                error_summary=_error_body_summary(error_body),
+                error_summary=error_summary,
                 total_elapsed_ms=round((time.monotonic() - started) * 1000),
             )
             return Response(error_body, status=upstream.status_code, headers=response_headers)
@@ -1383,13 +1543,21 @@ def create_app(settings: Settings, diag: DiagnosticLogger) -> Flask:
         if is_sse:
             model = summary.get("model") if isinstance(summary.get("model"), str) else None
             return Response(
-                _sse_relay(upstream, client, diag, settings, request_id, model),
+                _sse_relay(
+                    upstream,
+                    client,
+                    close_client,
+                    diag,
+                    settings,
+                    request_id,
+                    model,
+                ),
                 status=upstream.status_code,
                 headers=response_headers,
                 direct_passthrough=True,
             )
         return Response(
-            _generic_relay(upstream, client, diag, request_id),
+            _generic_relay(upstream, client, close_client, diag, request_id),
             status=upstream.status_code,
             headers=response_headers,
             direct_passthrough=True,
@@ -1454,7 +1622,9 @@ def _doctor(settings: Settings) -> int:
     output = create_diagnostic_zip(settings, probe)
     print(json.dumps(probe, ensure_ascii=False, indent=2))
     print(f"\n诊断包：{output}")
-    return 0 if probe.get("tls", {}).get("ok", True) else 2
+    tls_ok = probe.get("tls", {}).get("ok", True)
+    http_ok = probe.get("http_via_configured_transport", {}).get("ok", True)
+    return 0 if tls_ok and http_ok else 2
 
 
 def _pack(settings: Settings) -> int:
