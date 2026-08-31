@@ -6,9 +6,10 @@ model = "glm-5.3"
 model_reasoning_effort = "max"
 model_catalog_json = "~/.codex/models.json"
 
-# 企业代理环境下提前压缩历史，避免完整 Responses 请求增长到约 96 KB 后被切断。
-# 必须位于 [model_providers.ZAI_LOCAL_DIAG] 之前，才能成为 Codex 顶层配置。
-model_auto_compact_token_limit = 18000
+# 可选：历史自动压缩阈值。必须位于 [model_providers.ZAI_LOCAL_DIAG] 之前。
+# 第一次请先注释，验证 v0.4.x 的 adaptive/chunked 上传；若仍在约 90~100 KB 处失败，
+# 再取消注释，从 24000 开始，并根据日志里的 input_tokens / body_bytes 调整。
+# model_auto_compact_token_limit = 24000
 
 [model_providers.ZAI_LOCAL_DIAG]
 name = "智谱（本地诊断代理）"

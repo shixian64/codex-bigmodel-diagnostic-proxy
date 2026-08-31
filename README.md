@@ -138,7 +138,9 @@ Codex Base URL: http://127.0.0.1:8765/api/v1
 model_provider = "ZAI_LOCAL_DIAG"
 
 # 顶层配置，必须写在下面的 provider 表之前。
-model_auto_compact_token_limit = 18000
+# 第一次验证 v0.4.x 时先注释这一行，让 adaptive/chunked 传输单独接受测试。
+# 若仍在约 90~100 KB 请求处失败，再取消注释并从 24000 开始；不要盲目设得更大。
+# model_auto_compact_token_limit = 24000
 
 [model_providers.ZAI_LOCAL_DIAG]
 name = "智谱（本地诊断代理）"
@@ -152,7 +154,15 @@ stream_idle_timeout_ms = 600000
 
 关闭所有 Codex 窗口后重新启动。原有会话不会被删除。
 
-把 Codex 的 `request_max_retries` 和 `stream_max_retries` 都设为 `0`，由本地代理统一处理两次“预响应头全新连接重试”，避免 Codex 默认五次重试形成请求风暴。`model_auto_compact_token_limit=18000` 会在历史继续增长前让 Codex 自动总结上下文；它不清空任务，但非常旧的细节会被摘要替代。
+把 Codex 的 `request_max_retries` 和 `stream_max_retries` 都设为 `0`，由本地代理统一处理两次“预响应头全新连接重试”，避免 Codex 默认五次重试形成请求风暴。
+
+`model_auto_compact_token_limit` 不是模型上下文上限，而是触发历史摘要压缩的阈值。建议按以下顺序处理：
+
+1. **先验证传输修复**：暂时注释该配置，使用默认的 `adaptive` chunked 上传跑一轮较长对话。
+2. **若仍在大请求阶段失败**：设置 `24000` 作为临时折中值，并重新复现。
+3. **根据日志精调**：查看 `请求正常结束` 或失败记录中的 `body_bytes`、`input_tokens`。将阈值设为代理临界 Token 数的约 80%~90%；如果 chunked 已稳定承载原先约 98 KB 的请求，也可以提高到 `30000` 左右或继续不设置。
+
+压缩不会清空任务或删除 session，但很早的原始代码、日志和路径可能会被摘要替代。已有请求体已经超过企业代理阈值的旧任务，第一次压缩请求本身也可能无法上传；此时先新建任务并带入一份简短总结。
 
 `model_auto_compact_token_limit` 的定义见 [Codex 官方配置参考](https://developers.openai.com/codex/config-reference/)；它是 Token 阈值，不是字节数。
 
